@@ -462,7 +462,18 @@ if handles.plot_bad == 1 % bad ROIs
 
     % ROI to plot
     tmp = str2num(get(handles.deletelist,'String'));
-    idx = tmp(1);
+    try
+        % plot first bad ROI
+        idx = tmp(1);
+    catch
+        % plot first ROI
+        idx = 1;
+        
+        % update user
+        set(handles.user_alert, 'String', sprintf('No bad ROIs found!'));
+        pause(0.1); % make sure to update user_alert
+    end
+
     handles.plot_roi = idx;
 
     % select the first ROI in the dellist
