@@ -1,4 +1,4 @@
-<img src="https://github.com/bastijnvandenboom/PRISM/blob/307d04d1b26d33a71d7c0de32e9eaebb58b86bc9/PRISM_logo2.png" width="200">
+<img src="https://github.com/bastijnvandenboom/PRISM/blob/2fd173dfebb261060eb186d161a2e54ce8fd1e82/PRISM_logo2.png" width="200">
 
 # PRISM: Post-processing ROI Inspection, Sorting, & Merging
 
