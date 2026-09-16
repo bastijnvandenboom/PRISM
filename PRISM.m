@@ -168,6 +168,7 @@ handles.updatedS = [];
 handles.updatedresiduals = [];
 handles.updatedSNRcnmf = [];
 handles.SNR = [];
+handles.cn_display_transposed = false; % see the Cn-orientation fix below and in build_native_cnmfe
 handles.mergecells = [];
 handles.delcells = [];
 handles.pixels_A = [];
@@ -199,8 +200,17 @@ set(handles.deletelist, 'String', sprintf('ROIs to delete'), 'Value', 1); % upda
 set(handles.mergelist, 'String', sprintf('ROIs to merge'), 'Value', 1); % update values in mergelist
 set(handles.checkmergetxt, 'String', 'Click "Find repeats"'); % update values in mergelist
 
-% user select file
-[filename1, filepath1] = uigetfile('*.*', 'Select raw .hdf5 cnmf (caiman), Fall.mat (Suite2P), ~.mat (CNMF-E), or .mat preprocessed file');
+% user select file. Test/batch hook: if a full path is stashed in the
+% root appdata 'PRISM_test_infile', use it and skip the dialog (lets the
+% self-test drive load->save without user interaction).
+test_infile = getappdata(0, 'PRISM_test_infile');
+if ~isempty(test_infile)
+    [fp, fn, fe] = fileparts(test_infile);
+    filepath1 = [fp filesep];
+    filename1 = [fn fe];
+else
+    [filename1, filepath1] = uigetfile('*.*', 'Select raw .hdf5 cnmf (caiman), Fall.mat (Suite2P), ~.mat (CNMF-E), or .mat preprocessed file');
+end
 
 % user cancelled the dialog (or closed it) without picking a file -
 % uigetfile then returns 0 for both outputs, and cd(0)/strsplit(0,...)
@@ -212,6 +222,10 @@ if isequal(filename1, 0) || isequal(filepath1, 0)
 end
 
 cd(filepath1)
+
+% remember the source file so save can write native output in the same
+% format (and, for cnmf .hdf5, copy-and-patch the original - see save)
+handles.source_file = [filepath1 filename1];
 
 % update user
 set(handles.user_alert, 'String', sprintf('Loading data, please wait...'));
@@ -247,9 +261,17 @@ if strcmp(tmp, 'mat') % mat file
         end
         % old MATLAB CNMF-E has transposed Cn (no Mn field) — fix orientation
         % only applies to raw legacy CNMF-E .mat (no pipeline tag yet); skip once
-        % settings.pipeline exists (suite2p/cnmf, or any previously GUI-saved file)
-        if ~isfield(handles.rawdata1.results.settings, 'pipeline') && ~isfield(handles.rawdata1.results.settings, 'fnames')
+        % settings.pipeline exists (suite2p/cnmf) OR the file was already
+        % cleaned by PRISM (carries a PRISM field) - otherwise reloading a
+        % cleaned CNMF-E file for another round would re-transpose Cn.
+        if ~isfield(handles.rawdata1.results.settings, 'pipeline') && ...
+                ~isfield(handles.rawdata1.results.settings, 'fnames') && ...
+                ~isfield(handles.rawdata1.results, 'PRISM')
             handles.rawdata1.results.Cn = handles.rawdata1.results.Cn';
+            % this transpose is for GUI display only - build_native_cnmfe
+            % undoes it before saving so the output file's Cn matches the
+            % ORIGINAL file's orientation, not this display-oriented copy
+            handles.cn_display_transposed = true;
         end
         % update bad ROIs if needed
         if handles.plot_bad == 1 % update results
@@ -288,19 +310,40 @@ try % not everyone has these vars
     handles.updatedresiduals = handles.rawdata1.results.residuals;
     handles.updatedSNRcnmf = handles.rawdata1.results.SNR_cnmf;
 catch end
-try % check if we've ran the GUI before, important for rois_bad!
-    handles.GUI = handles.rawdata1.results.GUI;
-catch
-    handles.GUI = 'false';
+% identify the source pipeline so save can write native output (see
+% save_Callback). The loaders tag settings.pipeline as 'suite2p'/'cnmf';
+% a raw MATLAB CNMF-E .mat has no such tag -> 'cnmfe'.
+if isfield(handles.rawdata1.results, 'settings') && isfield(handles.rawdata1.results.settings, 'pipeline')
+    handles.source_pipeline = handles.rawdata1.results.settings.pipeline; % 'suite2p' or 'cnmf'
+else
+    handles.source_pipeline = 'cnmfe';
+end
+
+% native_index maps each working ROI to its index in the source file's
+% full component axis. suite2p/cnmf loaders return it (accounts for the
+% good-only subset when plot bad rois is off); a plain .mat is 1:N.
+if isfield(handles.rawdata1.results, 'native_index')
+    handles.native_index = double(handles.rawdata1.results.native_index(:))';
+else
+    handles.native_index = 1:size(handles.updatedCraw,1);
+end
+
+% detect a file PRISM has already cleaned. New files carry a PRISM struct;
+% older ones used results.GUI = 'true'. Either way the original ROI
+% numbers no longer match the pipeline's rois_bad, so bad-ROI plotting is
+% blocked on such files.
+handles.prism_used = isfield(handles.rawdata1.results, 'PRISM');
+if ~handles.prism_used
+    try, handles.prism_used = strcmp(handles.rawdata1.results.GUI, 'true'); catch, end
 end
 
 % check if we need to update bad ROIs
 if handles.plot_bad == 1 % update results
-    if strcmp(handles.GUI, 'true') % have we ran the GUI before?
+    if handles.prism_used % have we cleaned these data before?
         % update user
         set(handles.user_alert, 'String', sprintf('GUI has been used before on bad rois!'));
         pause(0.1); % make sure to update user_alert
-        error('GUI has been used before on these data, you cannot use bad ROIs because the ROI numbers probably will not match')
+        error('PRISM has been used before on these data, you cannot use bad ROIs because the ROI numbers probably will not match')
     end
     handles.rois_bad = handles.rawdata1.results.raw.rois_bad;
 end
@@ -347,6 +390,16 @@ end
 % define colors
 handles.colors = [56/255 176/255 0/255; 0/255 0/255 255/255; 255/255 0/255 0/255; 167/255 201/255 87/255]; % green, blue, red [single ROI, 2x dual ROIs, all contours]
 handles.color_plots = [.5 0 .5; 251/255 111/255 146/255]; % purple, pink [distance x corr and histo plots, selected ROIs]
+
+% initialise original-index tracking: each working ROI starts as exactly
+% one source ROI (its native_index). del_Callback and merge_Callback keep
+% this in sync (merged ROIs hold several native indices) so save can
+% rebuild a native file (see build_native_* / patch_hdf5).
+if isfield(handles, 'native_index')
+    handles.roi_orig = num2cell(handles.native_index);
+else
+    handles.roi_orig = num2cell(1:size(handles.updatedCraw,1));
+end
 
 % calculate SNR
 handles.SNR = get_SNR(handles.updatedC, handles.updatedCraw);
@@ -591,10 +644,12 @@ handles.updatedS(del_rois,:) = [];
 handles.updatedA(:,del_rois) = [];
 try % not everyone has these vars
     handles.updatedresiduals(del_rois,:) = [];
-    handles.updatedSNRcnmf(del_rois,:) = [];
 catch end
+% NOTE: SNR_cnmf (when present) is intentionally NOT re-indexed here -
+% see the comment in build_native_cnmfe for why.
 handles.SNR(:,del_rois) = [];
 handles.pixels_A(:,del_rois) = [];
+handles.roi_orig(del_rois) = []; % keep original-index map in sync
 
 % clear del_list
 set(handles.deletelist,'String',[]);
@@ -663,6 +718,7 @@ merge_rois = get(handles.mergelist,'String');
 % average activity (Craw, C, S) and combine contours (A)
 rois_keep = []; % first ROIs of the pairs, to  keep
 rois_delete = []; % all the other ROIs, to delete
+merged_orig = {}; % original-index union per merged ROI (for roi_orig)
 for i = 1:length(merge_rois) % per mergepair
 
     % temporal activity
@@ -671,21 +727,20 @@ for i = 1:length(merge_rois) % per mergepair
     rois_c = [];
     rois_s = [];
     rois_res = [];
-    rois_SNRcnmf = [];
     for u = 1:length(rois_pair) % per roi in mergepair
         rois_craw = [rois_craw; handles.updatedCraw(rois_pair(u),:)];
         rois_c = [rois_c; handles.updatedC(rois_pair(u),:)];
         rois_s = [rois_s; handles.updatedS(rois_pair(u),:)];
         try % not everyone has these vars
             rois_res = [rois_res; handles.updatedresiduals(rois_pair(u),:)];
-            rois_SNRcnmf = [rois_SNRcnmf; handles.updatedSNRcnmf(rois_pair(u),:)];
         catch end
     end
     merged_craw(i,:) = mean(rois_craw);
     merged_c(i,:) = mean(rois_c);
     merged_s(i,:) = mean(rois_s);
     merged_res(i,:) = mean(rois_res);
-    merged_SNRcnmf(i,:) = mean(rois_SNRcnmf);
+    % NOTE: SNR_cnmf (when present) is intentionally NOT accumulated/
+    % re-indexed here - see the comment in build_native_cnmfe for why.
 
     % spatial contour
     rois_a = [];
@@ -698,6 +753,13 @@ for i = 1:length(merge_rois) % per mergepair
     % keep track of ROIs
     rois_keep = [rois_keep rois_pair(1)]; % list of all first ROIs
     rois_delete = [rois_delete rois_pair(2:end)]; % list of all second and more ROIs
+
+    % union of source ROIs behind this merged ROI (mirrors rois_keep)
+    oo = [];
+    for u = 1:length(rois_pair)
+        oo = [oo handles.roi_orig{rois_pair(u)}];
+    end
+    merged_orig{i} = unique(oo);
 end
 handles.updatedCraw(rois_keep,:) = merged_craw; % store data on position first ROIs
 handles.updatedCraw(rois_delete,:) = []; % remove other ROIs
@@ -710,9 +772,12 @@ handles.updatedA(:,rois_delete) = [];
 try % not everyone has these vars
     handles.updatedresiduals(rois_keep,:) = merged_res; % same for residuals
     handles.updatedresiduals(rois_delete,:) = [];
-    handles.updatedSNRcnmf(rois_keep,:) = merged_SNRcnmf; % same for SNR_cnmf
-    handles.updatedSNRcnmf(rois_delete,:) = [];
 catch end
+
+% keep original-index map in sync: merged ROI holds the union of its
+% sources' original indices, then drop the merged-away partners
+handles.roi_orig(rois_keep)   = merged_orig;
+handles.roi_orig(rois_delete) = [];
 
 % clear merge data
 set(handles.mergelist,'String',[]);
@@ -797,50 +862,76 @@ pause(0.1); % make sure to update user_alert
 % starts (start_gui_Callback) and refreshed after every edit by
 % del_Callback and merge_Callback
 
-% find folder to save and make name
-folder_name = uigetdir;
-file_str = sprintf('%s\\updated_imaging.mat', folder_name);
-  
+% find folder to save. Test/batch hook: skip the dialog if a target dir
+% is stashed in root appdata 'PRISM_test_outdir'.
+test_outdir = getappdata(0, 'PRISM_test_outdir');
+if ~isempty(test_outdir)
+    folder_name = test_outdir;
+else
+    folder_name = uigetdir;
+end
+if isequal(folder_name, 0) % user cancelled the folder dialog
+    set(handles.user_alert, 'String', 'Save cancelled');
+    set(handles.save, 'Enable', 'on');
+    guidata(hObject, handles);
+    return
+end
+
 % update user
 set(handles.user_alert, 'String', sprintf('Storing data, please wait...'));
 pause(0.1); % make sure to update user_alert
 
-% generate results struct
-results = handles.rawdata1.results;
-results.C_raw = handles.updatedCraw;
-results.C = handles.updatedC;
-results.S = handles.updatedS;
-results.A = handles.updatedA;
-try % not everyone has these vars
-    results.residuals = handles.updatedresiduals;
-    results.SNR_cnmf = handles.updatedSNRcnmf;
-catch end
-results.SNR_gui = handles.SNR';
-results.GUI = 'true';
+% assemble the PRISM provenance record (identical across formats).
+% handles.SNR is already current - recomputed on start and after every
+% delete/merge. A merged ROI is one whose roi_orig holds >1 source index.
+n_out    = numel(handles.roi_orig);
+is_merge = cellfun(@(x) numel(x) > 1, handles.roi_orig);
+PRISM = struct();
+PRISM.used            = true;                       % reload detects this
+PRISM.version         = 'PRISM 2.0 (native output)';
+PRISM.date            = datestr(now, 'yyyy-mm-dd HH:MM:SS');
+PRISM.source_pipeline = handles.source_pipeline;    % suite2p | cnmfe | cnmf
+PRISM.snr             = handles.SNR(:)';            % recomputed per surviving ROI
+PRISM.n_out           = n_out;
+PRISM.n_merged        = sum(is_merge);
+PRISM.n_removed       = numel(handles.native_index) - n_out; % vs ROIs loaded
+PRISM.merged_idx      = find(is_merge);            % output rows that are merges
+PRISM.merged_sources  = handles.roi_orig(is_merge);% their source native indices
+PRISM.roi_orig        = handles.roi_orig;          % output ROI -> source index map
 
-% allow loading bad ROIs
+% write native output in the SAME format as the input
+% output keeps the input's base name with a _PRISM suffix, so the file
+% NAME leads the differentiation while the CONTENT stays native.
+[~, base] = fileparts(handles.source_file);
+base = regexprep(base, '_PRISM$', '');   % avoid _PRISM_PRISM on re-saves
+switch handles.source_pipeline
+    case 'suite2p'
+        file_str = fullfile(folder_name, [base '_PRISM.mat']);
+        build_native_suite2p(handles, PRISM, file_str);
+    case 'cnmfe'
+        file_str = fullfile(folder_name, [base '_PRISM.mat']);
+        build_native_cnmfe(handles, PRISM, file_str);
+    case 'cnmf'
+        file_str = fullfile(folder_name, [base '_PRISM.hdf5']);
+        patch_hdf5(handles, PRISM, file_str);
+    otherwise
+        error('PRISM:unknownPipeline', 'Unknown source pipeline: %s', handles.source_pipeline);
+end
+
+% allow loading bad ROIs again
 handles.plot_bad_update = 1;    % allow updating bad ROI plotting
 
-% % ROI(s) to plot
-% idx = 1:size(results.A,2); % all ROIs
-% 
-% % plot background (Cn or Mn) and ROI contours (idx)
-% plot_spatial_components(handles, idx)
-
-% save data
-save(file_str,'results','-v7.3');
-
-% save screenshot figure
-fig1_str = sprintf('%s\\screenshot_GUI.png', folder_name);
-frame = getframe(handles.figure1); % Capture the GUI figure
-imwrite(frame.cdata, fig1_str); % Save as an image file
+% save screenshot figure (best-effort; skipped on a headless session)
+try
+    fig1_str = fullfile(folder_name, 'screenshot_GUI.png');
+    frame = getframe(handles.figure1); % Capture the GUI figure
+    imwrite(frame.cdata, fig1_str);    % Save as an image file
+catch
+end
 
 % feedback to user
 set(handles.user_alert, 'String', sprintf('Done saving! Saved at: %s', file_str));
 pause(0.1); % make sure to update user_alert
-
-% go up one folder (store data in new folder)
-% cd ..
 
 % store data
 guidata(hObject,handles);
@@ -2386,89 +2477,85 @@ end
 
 
 function [snr] = get_SNR(dataC, dataCraw)
-% estimate SNR as (peak - baseline) / noise, in units of noise std
-% find location peaks based on C, value based on Craw
-% noise/baseline are estimated from all Craw data without peaks
+% Estimate per-ROI SNR as (transient amplitude) / noise, in units of noise
+% std. Peaks are located on the denoised trace C, their amplitude read from
+% the raw trace C_raw, and noise/baseline estimated from the peak-free C_raw.
 % inputs:
-%   dataC = denoised trace to calculate peaks, T*1 vector, calcium trace
-%   dataCraw = raw trace to calculate noise, T*1 vector, calcium trace
+%   dataC    = denoised traces [nROI x T] (used to locate peaks)
+%   dataCraw = raw traces      [nROI x T] (used for amplitude and noise)
 %
-% NOTE: previous version computed snr = peak / prctile(baseline, 90),
-% i.e. a ratio of two raw magnitudes with no baseline subtraction. That
-% only approximates a real SNR when Craw already sits at ~0 baseline
-% (true for CNMF-E, roughly true for CaImAn's F_dff). It breaks for
-% suite2p, whose Craw (F - 0.7*Fneu) keeps the full resting fluorescence
-% offset, so peak/baseline collapsed toward 1 regardless of transient
-% size. Subtracting a low-percentile baseline (F0 estimate) before
-% dividing by a robust noise std makes the metric comparable across
-% toolboxes regardless of each one's absolute trace offset/scale.
+% Amplitude = (C_raw peak) - (F0, a low percentile of the peak-free trace);
+% noise = MAD-based robust std of the peak-free trace. The reported SNR is
+% the MEDIAN over PROMINENT transients only - peaks whose amplitude exceeds
+% promFactor x noise. Restricting to prominent transients stops the many
+% small noise-wiggle maxima from dragging the median down (which made the
+% old "median over every local maximum" value read too low). Subtracting F0
+% before dividing by a robust noise makes the metric comparable across
+% toolboxes regardless of each one's absolute trace offset/scale (important
+% for Suite2P, whose C_raw = F - 0.7*Fneu keeps the resting offset).
+%
+% Toolbox-free: uses find_local_maxima (below) instead of findpeaks, and
+% local_prctile / median(...,'omitnan') instead of prctile / nanmedian, so
+% no Signal Processing or Statistics Toolbox license is required.
 
 % fixed vars
-windowCraw = 5; % window before peak in C to find peak in Craw data
-windowCrawRemove = 2; % window around Craw peak to remove for baseline
-baselinePercentile = 8; % low percentile of baseline (excl. peaks) used as F0 estimate
+windowCraw       = 5;  % window before a C peak to find the C_raw peak
+windowCrawRemove = 2;  % half-window around each C_raw peak removed for baseline
+baselinePercentile = 8;% low percentile of the peak-free trace used as F0
+promFactor       = 3;  % a transient is "prominent" if amplitude >= this x noise
 
-% find peaks and baseline to calculate SNR
-for k = 1:size(dataC,1)    % per roi
+nROI = size(dataC,1);
+snr  = nan(1, nROI);
+for k = 1:nROI
 
-    % get baseline data Craw
-    baseline = dataCraw(k,:);
+    baseline = dataCraw(k,:);              % becomes the peak-free trace below
+    loc = find_local_maxima(dataC(k,:));   % peaks in denoised C (no toolbox)
+    if isempty(loc), snr(k) = nan; continue; end
 
-    % peaks in C
-    [~, loc] = findpeaks(dataC(k,:));
-
-    % get window to find peaks in Craw
-    locOn = loc - windowCraw; % go back in time to find max peak in Craw
+    locOn  = max(loc - windowCraw, 1);     % look back in time in C_raw
     locOff = loc;
 
-    % make sure locOn is above frame 1
-    for kk = 1:length(locOn) % per peak 
-        if locOn(kk) < 1
-            locOn(kk) = 1;
-        end
+    % read each peak's amplitude in C_raw and blank its window in baseline
+    max_val = zeros(1, numel(loc));
+    for kk = 1:numel(loc)
+        [mv, mi] = max(dataCraw(k, locOn(kk):locOff(kk)));
+        max_val(kk) = mv;
+        aidx = mi + locOn(kk) - 1;
+        lo = max(aidx - windowCrawRemove, 1);
+        hi = min(aidx + windowCrawRemove, numel(baseline));
+        baseline(lo:hi) = nan;
     end
 
-    % find peak values in Craw and remove from baseline
-    for kk = 1:length(locOn) % per peak
-        [max_val(kk), max_idx(kk)] = max(dataCraw(k, locOn(kk):locOff(kk))); % get max value and its location
-        abs_max_idx(kk) = max_idx(kk)+locOn(kk)-1; % find absolute location
-        if abs_max_idx(kk)-windowCrawRemove < 1 % value might be frame 1
-            baseline(1, 1:abs_max_idx(kk)+2) = nan(1,length(1:abs_max_idx(kk)+2));
-        else
-            baseline(1, abs_max_idx(kk)-windowCrawRemove : abs_max_idx(kk)+windowCrawRemove) = nan(1,5);
-        end
-    end
-    
-    % calculate SNR
-    if exist('max_val', 'var') % check if we have at least 1 max_val
-%         snr(k) = nanmedian(max_val) / nanstd(baseline);              % old: no baseline subtraction
-%         snr(k) = nanmedian(max_val) / prctile(baseline, 90);         % old: ratio of raw magnitudes
-        baseline_level = prctile(baseline, baselinePercentile);        % F0 estimate (low percentile, excl. peaks)
-        noise_std = 1.4826 * nanmedian(abs(baseline - nanmedian(baseline))); % robust std (MAD-based)
-        snr(k) = (nanmedian(max_val) - baseline_level) / noise_std;
-    else
-        snr(k) = nan;
-    end
+    baseline_level = local_prctile(baseline, baselinePercentile);       % F0
+    noise_std      = 1.4826 * median(abs(baseline - median(baseline,'omitnan')), 'omitnan'); % robust std
+    if ~(noise_std > 0), snr(k) = nan; continue; end
 
-    % clear vars
-    clear loc locOn locOff baseline max_val max_idx abs_max_idx
+    amp  = max_val - baseline_level;              % per-transient amplitude over F0
+    kept = amp(amp >= promFactor * noise_std);    % prominent transients only
+    if isempty(kept), kept = amp; end             % fall back to all if none pass
+    snr(k) = median(kept) / noise_std;
 end
 
-% % find peaks and baseline to calculate SNR
-% for k = 1:size(dataC,1)    % per roi
-%     % get baseline data
-%     baseline = dataCraw(k,:);
-%     % peaks in C
-%     [~, loc] = findpeaks(dataC(k,:)); % , 3
-%     % find peak values in Craw
-%     pk = dataCraw(k,loc);
-%     % baseline in Craw
-%     baseline(loc) = [];
-%     % SNR
-%     snr(k) = median(pk) / std(baseline);
-% 
-%     clear pk loc baseline
-% end
+
+function loc = find_local_maxima(x)
+% Indices of strict interior local maxima: x(i) > x(i-1) and x(i) > x(i+1).
+% Toolbox-free replacement for findpeaks with default options.
+x = x(:)';
+if numel(x) < 3, loc = []; return; end
+d = diff(x);
+loc = find(d(1:end-1) > 0 & d(2:end) < 0) + 1;
+
+
+function y = local_prctile(v, p)
+% Percentile p (0-100) of v ignoring NaNs, matching MATLAB prctile's
+% midpoint convention with linear interpolation. Toolbox-free.
+v = sort(v(~isnan(v)));
+if isempty(v),   y = NaN;  return; end
+if isscalar(v),  y = v(1); return; end
+n = numel(v);
+q = (0.5:1:(n-0.5)) / n * 100;      % plotting positions of the sorted data
+y = interp1(q, v, p, 'linear');
+if isnan(y), if p <= q(1), y = v(1); else, y = v(end); end; end  % clamp ends
 
 
 function plot_temporal_traces(handles, idx)
@@ -3080,6 +3167,8 @@ try % not everyone has the (pw)rigid movements
 catch end
 
 % store good or all ROIs -> if all, the bad ROIs go into delete list
+% native_index maps each working ROI back to its component index in the
+% original .hdf5, so save can copy-and-patch a native file (see patch_hdf5)
 if isequal(rois_good, rois_bad') % user decided to discard all the bad rois
     % store only the good rois
     output.C_raw = C_raw(:, :);
@@ -3090,6 +3179,7 @@ if isequal(rois_good, rois_bad') % user decided to discard all the bad rois
         output.residuals = residuals(:, :);
         output.SNR_cnmf = SNR(:, :);
     catch end
+    output.native_index = 1:size(C_raw,1);
 elseif handles.plot_bad == 0 % only good ROIs
     % store only the good rois
     output.C_raw = C_raw(rois_good, :);
@@ -3100,6 +3190,7 @@ elseif handles.plot_bad == 0 % only good ROIs
         output.residuals = residuals(rois_good, :);
         output.SNR_cnmf = SNR(rois_good, :);
     catch end
+    output.native_index = rois_good;
 elseif handles.plot_bad == 1 % all ROIs (good and bad)
     % store all the ROIs
     output.C_raw = C_raw(:, :);
@@ -3111,6 +3202,7 @@ elseif handles.plot_bad == 1 % all ROIs (good and bad)
         output.SNR_cnmf = SNR(:, :);
     catch end
     output.rois_bad = rois_bad;
+    output.native_index = 1:size(C_raw,1);
 end
 
 % store images
@@ -3248,19 +3340,37 @@ output.raw.rois_good = rois_good;
 output.raw.rois_bad  = rois_bad;
 output.raw.iscell    = iscell_mat;
 
-% store good or all ROIs depending on plot_bad setting
+% store good or all ROIs depending on plot_bad setting.
+% native_index maps each working ROI back to its row in the full Fall.mat
+% arrays, so save can rebuild a native Fall.mat (see build_native_suite2p).
 if handles.plot_bad == 0    % only good ROIs (iscell == 1)
     output.C_raw = C_raw_all(rois_good, :);
     output.C     = C_all(rois_good, :);
     output.S     = S_all(rois_good, :);
     output.A     = A_all(:, rois_good);
+    output.native_index = rois_good;
 elseif handles.plot_bad == 1  % all ROIs; bad ROIs go to delete list
     output.C_raw    = C_raw_all;
     output.C        = C_all;
     output.S        = S_all;
     output.A        = A_all;
     output.rois_bad = rois_bad;
+    output.native_index = 1:nROI;
 end
+
+% retain the full native Fall.mat data so save can rebuild a native file
+% (only A/C/C_raw/S are used for display; F/Fneu/spks/stat/iscell are what
+% Suite2P actually reads back)
+output.native.F      = s2p.F;
+output.native.Fneu   = s2p.Fneu;
+output.native.spks   = s2p.spks;
+output.native.stat   = s2p.stat;
+output.native.iscell = s2p.iscell;
+output.native.ops    = s2p.ops;
+% optional second-channel fields (present only for 2-channel recordings)
+if isfield(s2p, 'redcell'),    output.native.redcell    = s2p.redcell;    end
+if isfield(s2p, 'F_chan2'),    output.native.F_chan2    = s2p.F_chan2;    end
+if isfield(s2p, 'Fneu_chan2'), output.native.Fneu_chan2 = s2p.Fneu_chan2; end
 
 % background images
 output.Cn = Cn;
@@ -3289,3 +3399,322 @@ else  % both empty, or both non-empty
     set(handles.del,   'Enable', 'off');
     set(handles.merge, 'Enable', 'off');
 end
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% NATIVE OUTPUT (SAVE)
+% These helpers rebuild a file in the SAME format that was loaded, using
+% the retained native data and handles.roi_orig (output ROI -> the source
+% ROI index/indices behind it). Deleted ROIs are physically gone; merged
+% ROIs average their temporal signals and union their footprints; per-ROI
+% quantities that cannot be meaningfully combined are set to NaN for
+% merged ROIs only (see PRISM.md for the exact per-format list).
+
+
+function build_native_suite2p(handles, PRISM, file_str)
+% rebuild a native Suite2P Fall.mat with only the surviving/merged ROIs.
+nat      = handles.rawdata1.results.native;   % full native Fall.mat data
+roi_orig = handles.roi_orig;                  % output ROI -> source row(s)
+nOut     = numel(roi_orig);
+T        = size(nat.F, 2);
+
+F      = zeros(nOut, T, 'like', nat.F);
+Fneu   = zeros(nOut, T, 'like', nat.Fneu);
+spks   = zeros(nOut, T, 'like', nat.spks);
+iscell = zeros(nOut, size(nat.iscell, 2));
+stat   = cell(1, nOut);
+
+% redcell/F_chan2/Fneu_chan2 are top-level Fall.mat keys whenever Suite2P
+% was run with 2-channel support, but are [0x0] empty placeholders on a
+% session with no real second channel / no red-cell pass (as opposed to
+% simply being absent). Always carry the key through when Suite2P wrote
+% it at all, so the output keeps the same schema as the input: slice
+% per-ROI when there is real data to slice, otherwise pass the empty
+% placeholder through unchanged (indexing into it would error).
+has_red   = isfield(nat, 'redcell');
+has_chan2 = isfield(nat, 'F_chan2') && isfield(nat, 'Fneu_chan2');
+red_empty   = has_red   && isempty(nat.redcell);
+chan2_empty = has_chan2 && (isempty(nat.F_chan2) || isempty(nat.Fneu_chan2));
+
+if has_red && ~red_empty,     redcell    = zeros(nOut, size(nat.redcell, 2)); end
+if has_chan2 && ~chan2_empty
+    F_chan2    = zeros(nOut, T, 'like', nat.F_chan2);
+    Fneu_chan2 = zeros(nOut, T, 'like', nat.Fneu_chan2);
+end
+
+for i = 1:nOut
+    src = roi_orig{i};
+    if isscalar(src)                     % untouched ROI: copy verbatim
+        F(i,:)      = nat.F(src,:);
+        Fneu(i,:)   = nat.Fneu(src,:);
+        spks(i,:)   = nat.spks(src,:);
+        iscell(i,:) = [1 nat.iscell(src, 2:end)];
+        stat{i}     = nat.stat{src};
+        if has_red && ~red_empty,     redcell(i,:) = nat.redcell(src,:); end
+        if has_chan2 && ~chan2_empty
+            F_chan2(i,:)    = nat.F_chan2(src,:);
+            Fneu_chan2(i,:) = nat.Fneu_chan2(src,:);
+        end
+    else                                 % merged ROI: combine
+        F(i,:)      = mean(nat.F(src,:), 1);
+        Fneu(i,:)   = mean(nat.Fneu(src,:), 1);
+        spks(i,:)   = mean(nat.spks(src,:), 1);
+        iscell(i,:) = [1 nat.iscell(src(1), 2:end)]; % cell; keep first's prob
+        stat{i}     = combine_stat_suite2p(nat.stat(src));
+        if has_red && ~red_empty,     redcell(i,:) = nat.redcell(src(1),:); end
+        if has_chan2 && ~chan2_empty
+            F_chan2(i,:)    = mean(nat.F_chan2(src,:), 1);
+            Fneu_chan2(i,:) = mean(nat.Fneu_chan2(src,:), 1);
+        end
+    end
+end
+
+% assemble as top-level variables (what Suite2P reads back), + PRISM
+out = struct();
+out.F = F; out.Fneu = Fneu; out.spks = spks;
+out.iscell = iscell; out.stat = stat; out.ops = nat.ops;
+if has_red
+    if red_empty, out.redcell = nat.redcell; else, out.redcell = redcell; end
+end
+if has_chan2
+    if chan2_empty
+        out.F_chan2 = nat.F_chan2; out.Fneu_chan2 = nat.Fneu_chan2;
+    else
+        out.F_chan2 = F_chan2; out.Fneu_chan2 = Fneu_chan2;
+    end
+end
+out.PRISM = PRISM;
+save(file_str, '-struct', 'out', '-v7.3');
+
+
+function s = combine_stat_suite2p(stat_cells)
+% combine several Suite2P stat structs: union the pixel lists (summing lam
+% on overlap), recompute med/npix; geometry that cannot be unioned -> NaN.
+ypix = []; xpix = []; lam = [];
+for k = 1:numel(stat_cells)
+    ypix = [ypix; double(stat_cells{k}.ypix(:))];
+    xpix = [xpix; double(stat_cells{k}.xpix(:))];
+    lam  = [lam;  double(stat_cells{k}.lam(:))];
+end
+[u, ~, ic] = unique([ypix xpix], 'rows');   % merge duplicate pixels
+lam_sum = accumarray(ic, lam);
+s = stat_cells{1};                           % inherit the first ROI's stat
+s.ypix = u(:,1)';                            % then overwrite the pixel list
+s.xpix = u(:,2)';
+s.lam  = lam_sum';
+s.npix = numel(lam_sum);
+s.med  = [median(u(:,1)) median(u(:,2))];    % [y x], as suite2p
+% all other geometry fields (compact, solidity, radius, ...) are kept from
+% the first source ROI unchanged (see PRISM.md)
+
+
+function build_native_cnmfe(handles, PRISM, file_str)
+% rebuild a native CNMF-E .mat. The working arrays already ARE the native
+% per-ROI fields (A/C/C_raw/S) in output order, so we take the original
+% results struct and swap them in. options/P and everything else pass
+% through unchanged - P.sn_neuron/kernel_pars are deliberately NOT
+% re-indexed (they are already not 1:1 with ROIs in source; see PRISM.md).
+results = handles.rawdata1.results;
+results.C_raw = handles.updatedCraw;
+results.C     = handles.updatedC;
+results.S     = handles.updatedS;
+results.A     = handles.updatedA;
+% residuals (YrA-style), when a source genuinely has it, IS 1:1 with the
+% ROI set, so carry the delete/merge-tracked version through - but only
+% when the source actually had one (handles.updatedresiduals is [] from
+% init otherwise, and assigning it would add a field the native format
+% never had, e.g. plain CNMF-E .mat).
+if ~isempty(handles.updatedresiduals)
+    results.residuals = handles.updatedresiduals;
+end
+% SNR_cnmf, when present, is an initialization-era array computed over ALL
+% candidate components CNMF considered (including ones already rejected
+% before PRISM ever saw the file) - NOT 1:1 with the current ROI set, the
+% same situation PRISM.md documents for CNMF-E's P.sn_neuron/kernel_pars.
+% Re-indexing it with ROI delete/merge indices (as an earlier version did
+% via handles.updatedSNRcnmf) silently scrambles it, so it is deliberately
+% left untouched here: `results` above already carries the source's
+% original SNR_cnmf through verbatim, or omits it entirely if the source
+% never had one.
+% Cn: on a raw legacy CNMF-E .mat, LoadFile_Callback transposes Cn
+% in-place for correct GUI display (old MATLAB CNMF-E stores it
+% transposed relative to what the A-matrix pixel indexing expects).
+% `results` above is that same display-oriented struct, so undo the
+% transpose here - otherwise the saved file's Cn comes out rotated
+% relative to the ORIGINAL file (see PRISM.md/GitHub issue: 240x376 saved
+% as 376x240).
+if isfield(handles, 'cn_display_transposed') && handles.cn_display_transposed && isfield(results, 'Cn')
+    results.Cn = results.Cn';
+end
+% strip PRISM-internal/legacy fields, then attach the provenance record
+for f = {'native','native_index','GUI','SNR_gui','settings'}
+    if isfield(results, f{1}), results = rmfield(results, f{1}); end
+end
+results.PRISM = PRISM;
+save(file_str, 'results', '-v7.3');
+
+
+function patch_hdf5(handles, PRISM, file_str)
+% rebuild a native CaImAn/CNMF .hdf5 by copying the original file and
+% patching only the per-ROI datasets under /estimates to the surviving
+% (possibly merged) ROI set. Everything non-per-ROI (dims, sn, b, f,
+% background, /params) is preserved byte-for-byte.
+%
+% Structured in phases so the file is opened for low-level writing only
+% ONCE: (1) read every original dataset and compute its replacement in
+% memory, (2) delete all target datasets in a single H5F session, (3)
+% recreate them with the high-level API. Resizing a dataset needs a
+% delete+recreate, and interleaving many low-level opens with high-level
+% h5read/h5create can deadlock on Windows file locking - doing all the
+% low-level deletes in one session avoids that.
+src      = handles.source_file;
+roi_orig = handles.roi_orig;
+nOut     = numel(roi_orig);
+setenv('HDF5_USE_FILE_LOCKING','FALSE');
+copyfile(src, file_str);
+
+% authoritative component count / pixel count from the sparse footprint
+shp = double(h5read(file_str, '/estimates/A/shape'));
+pix = shp(1);
+M   = shp(2);
+
+% temporal datasets that are averaged on merge; everything else per-ROI is
+% NaN'd on merge (floats) or kept-first (integers).
+avg_set  = {'C','S','YrA','F_dff','R'};
+skip_set = {'dims','sn','b','f'};    % never per-ROI even if a dim == M
+
+% ---- phase 1: read originals + compute replacements (no writes yet) ----
+dels   = {};                               % dataset paths to delete
+wpath  = {};  wdata = {};                  % non-empty datasets to (re)create
+info = h5info(file_str, '/estimates');
+for d = 1:numel(info.Datasets)
+    name = info.Datasets(d).Name;
+    if any(strcmp(name, skip_set)), continue; end
+    path = ['/estimates/' name];
+    if strcmp(name, 'idx_components')      % all survivors are "good"
+        v = h5read(file_str, path);
+        dels{end+1} = path; wpath{end+1} = path; wdata{end+1} = cast(0:(nOut-1), class(v)); %#ok<AGROW>
+        continue
+    elseif strcmp(name, 'idx_components_bad')
+        dels{end+1} = path;  continue      % delete, leave absent %#ok<AGROW>
+    end
+    sz = info.Datasets(d).Dataspace.Size;
+    a  = find(sz == M, 1);                 % ROI axis
+    if isempty(a), continue; end           % not a per-ROI dataset
+    v = h5read(file_str, path);
+    dels{end+1}  = path; %#ok<AGROW>
+    wpath{end+1} = path; %#ok<AGROW>
+    wdata{end+1} = patch_axis(v, a, roi_orig, any(strcmp(name, avg_set))); %#ok<AGROW>
+end
+
+% sparse footprint A (CSC triplet) - compute new arrays in memory
+[Ad, Ai, Ap, Ash] = build_new_A(file_str, roi_orig, pix, M);
+Anames = {'data','indices','indptr','shape'};
+Avals  = {Ad, Ai, Ap, Ash};
+for k = 1:4
+    dels{end+1}  = ['/estimates/A/' Anames{k}]; %#ok<AGROW>
+    wpath{end+1} = ['/estimates/A/' Anames{k}]; %#ok<AGROW>
+    wdata{end+1} = Avals{k};                     %#ok<AGROW>
+end
+
+% PRISM provenance datasets
+wpath{end+1} = '/PRISM/snr';       wdata{end+1} = double(PRISM.snr(:)');   %#ok<AGROW>
+wpath{end+1} = '/PRISM/n_out';     wdata{end+1} = double(PRISM.n_out);     %#ok<AGROW>
+wpath{end+1} = '/PRISM/n_merged';  wdata{end+1} = double(PRISM.n_merged);  %#ok<AGROW>
+wpath{end+1} = '/PRISM/n_removed'; wdata{end+1} = double(PRISM.n_removed); %#ok<AGROW>
+if ~isempty(PRISM.merged_idx)
+    wpath{end+1} = '/PRISM/merged_idx'; wdata{end+1} = double(PRISM.merged_idx(:)')-1; %#ok<AGROW>
+end
+
+% ---- phase 2: delete every target dataset in ONE low-level session ----
+fid = H5F.open(file_str, 'H5F_ACC_RDWR', 'H5P_DEFAULT');
+for k = 1:numel(dels)
+    try, H5L.delete(fid, dels{k}, 'H5P_DEFAULT'); catch, end
+end
+H5F.flush(fid, 'H5F_SCOPE_GLOBAL');
+H5F.close(fid);
+
+% ---- phase 3: recreate datasets with the high-level API ----
+for k = 1:numel(wpath)
+    data = wdata{k};
+    sz = size(data);
+    if isrow(data) || iscolumn(data), sz = numel(data); end
+    h5create(file_str, wpath{k}, sz, 'Datatype', class(data));
+    h5write(file_str, wpath{k}, data);
+end
+
+% ---- phase 4: PRISM group attributes ----
+h5writeatt(file_str, '/PRISM', 'used', int8(1));
+h5writeatt(file_str, '/PRISM', 'version', PRISM.version);
+h5writeatt(file_str, '/PRISM', 'date', PRISM.date);
+h5writeatt(file_str, '/PRISM', 'source_pipeline', PRISM.source_pipeline);
+
+
+function nv = patch_axis(val, a, roi_orig, do_avg)
+% shrink/combine a per-ROI array along axis a (1 or 2) per roi_orig.
+% Merged ROIs: temporal datasets are averaged; every other per-ROI field
+% KEEPS THE FIRST source ROI's value (the merged ROI lives at that slot).
+nOut = numel(roi_orig);
+if a == 1
+    nv = zeros(nOut, size(val,2), 'like', val);
+    for i = 1:nOut
+        src = roi_orig{i};
+        if isscalar(src),   nv(i,:) = val(src,:);
+        elseif do_avg,      nv(i,:) = mean(val(src,:), 1);
+        else,               nv(i,:) = val(src(1),:);   % keep first source
+        end
+    end
+else % a == 2
+    nv = zeros(size(val,1), nOut, 'like', val);
+    for i = 1:nOut
+        src = roi_orig{i};
+        if isscalar(src),   nv(:,i) = val(:,src);
+        elseif do_avg,      nv(:,i) = mean(val(:,src), 2);
+        else,               nv(:,i) = val(:,src(1));    % keep first source
+        end
+    end
+end
+
+
+function [data_out, idx_out, ptr_out, shape_out] = build_new_A(file_str, roi_orig, pix, M)
+% compute the cleaned /estimates/A (scipy CSC triplet) for the cleaned ROI
+% set, WITHOUT writing - the caller writes it in the batched phase.
+d    = h5read(file_str, '/estimates/A/data');
+ridx = double(h5read(file_str, '/estimates/A/indices')) + 1;  % 1-based rows
+cptr = double(h5read(file_str, '/estimates/A/indptr'))  + 1;  % 1-based ptrs
+cls_data = class(d);
+cls_idx  = class(h5read(file_str, '/estimates/A/indices'));
+cls_ptr  = class(h5read(file_str, '/estimates/A/indptr'));
+cls_shp  = class(h5read(file_str, '/estimates/A/shape'));
+
+% reconstruct original sparse A [pix x M]
+rows = []; cols = []; vals = [];
+for c = 1:M
+    s = cptr(c); e = cptr(c+1) - 1;
+    if e >= s
+        rows = [rows; ridx(s:e)];
+        cols = [cols; c*ones(e-s+1,1)];
+        vals = [vals; double(d(s:e))];
+    end
+end
+Aorig = sparse(rows, cols, vals, pix, M);
+
+% build cleaned A [pix x nOut]: sum footprints for merged, copy singletons
+nOut = numel(roi_orig);
+Anew = sparse(pix, nOut);
+for i = 1:nOut
+    src = roi_orig{i};
+    if isscalar(src), Anew(:,i) = Aorig(:,src);
+    else,             Anew(:,i) = sum(Aorig(:,src), 2);
+    end
+end
+
+% MATLAB sparse is CSC; find() returns column-major order = CSC order
+[ir, jc, vv] = find(Anew);
+counts  = accumarray(jc, 1, [nOut 1]);
+indptr  = [0; cumsum(counts)];          % 0-based, length nOut+1
+indices = ir - 1;                        % 0-based row indices
+
+data_out  = cast(vv,             cls_data);
+idx_out   = cast(indices,        cls_idx);
+ptr_out   = cast(indptr,         cls_ptr);
+shape_out = cast([pix; nOut],    cls_shp);
